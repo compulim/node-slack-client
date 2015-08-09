@@ -121,13 +121,26 @@ class Client extends EventEmitter
         @onMessage JSON.parse(data)
 
       @ws.on 'error', (error)=>
-        # TODO: Reconnect?
         @emit 'error', error
+        @connected = false
+        @socketUrl = null
+
+        if @_pongTimeout
+          clearInterval @_pongTimeout
+          @_pongTimeout = null
+
+        if @autoReconnect then @reconnect()
 
       @ws.on 'close', =>
         @emit 'close'
         @connected = false
         @socketUrl = null
+
+        if @_pongTimeout
+          clearInterval @_pongTimeout
+          @_pongTimeout = null
+
+        if @autoReconnect then @reconnect()
 
       @ws.on 'ping', (data, flags) =>
         @ws.pong
@@ -154,7 +167,7 @@ class Client extends EventEmitter
       @_pongTimeout = null
 
     @authenticated = false
-    
+
     # Test for a null value on ws to prevent system failure (e.g. if Bot is disabled)
     if @ws
       @ws.close()
@@ -488,7 +501,7 @@ class Client extends EventEmitter
 
       when 'star_added'
           @emit 'star_added', message
-      
+
       when 'star_removed'
           @emit 'star_removed', message
 
@@ -536,7 +549,7 @@ class Client extends EventEmitter
 
     post_data = querystring.stringify(params)
 
-    options = 
+    options =
       hostname: @host,
       method: 'POST',
       path: '/api/' + method,
