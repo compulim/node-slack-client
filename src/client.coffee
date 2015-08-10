@@ -1,8 +1,9 @@
-https       = require 'https'
-querystring = require 'querystring'
-WebSocket   = require 'ws'
+https          = require 'https'
+querystring    = require 'querystring'
+WebSocket      = require 'ws'
 Log            = require 'log'
 {EventEmitter} = require 'events'
+async          = require 'async'
 
 User = require './user'
 Team = require './team'
@@ -37,7 +38,7 @@ class Client extends EventEmitter
     @_connAttempts  = 0
 
     @logger         = new Log process.env.SLACK_LOG_LEVEL or 'info'
-
+    
   #
   # Logging in and connection management functions
   #
@@ -563,5 +564,173 @@ class Client extends EventEmitter
 
     req.write('' + post_data)
     req.end()
+
+  login2: (state) ->
+    state = state or 'login'
+
+    async.doWhilst (callback) =>
+      @authenticated = false
+      @connected = false
+
+      @_connAttempts and @logger.info 'Reconnecting in %dms', @_connAttempts * 1000
+
+      setTimeout =>
+        @_connAttempts and @logger.info 'Attempting reconnect'
+        async.auto {
+          webSocketUrl: (callback) =>
+            if state != 'login'
+              return callback null, @socketUrl
+
+            timeout = setTimeout =>
+              callback && callback(new Error('timeout'))
+              callback = 0
+            , 10000
+
+            @logger.info 'Connecting...'
+            @_apiCall 'rtm.start', {agent: 'node-slack'}, (data) =>
+              clearTimeout timeout
+
+              if callback
+                if not data
+                  callback new Error()
+                else if not data.ok
+                  callback new Error(data.error)
+                else
+                  @authenticated = true
+
+                  # Important information about ourselves
+                  @self = new User @, data.self
+                  @team = new Team @, data.team.id, data.team.name, data.team.domain
+
+                  # Stash our websocket url away for later -- must be used within 30 seconds!
+                  @socketUrl = data.url
+
+                  # Stash our list of other users (DO THIS FIRST)
+                  for k of data.users
+                    u = data.users[k]
+                    @users[u.id] = new User @, u
+
+                  # Stash our list of channels
+                  for k of data.channels
+                    c = data.channels[k]
+                    @channels[c.id] = new Channel @, c
+
+                  # Stash our list of dms
+                  for k of data.ims
+                    i = data.ims[k]
+                    @dms[i.id] = new DM @, i
+
+                  # Stash our list of private groups
+                  for k of data.groups
+                    g = data.groups[k]
+                    @groups[g.id] = new Group @, g
+
+                  # TODO: Process bots
+
+                  @emit 'loggedIn', @self, @team
+                  callback null, @socketUrl
+
+                callback = 0
+
+          ws: ['webSocketUrl', (callback, results) =>
+            timeout = setTimeout =>
+              ws.removeListener 'open', onOpen
+              ws.removeListener 'error', onError
+              ws.removeListener 'message', onMessage
+              ws.close()
+
+              callback && callback new Error('timeout')
+              callback = 0
+            , 10000
+
+            # ws = new WebSocket results.webSocketUrl
+            ws = new WebSocket 'ws://localhost:7523'
+
+            onOpen = () =>
+              ws.send '__PROXYTO:' + results.webSocketUrl
+
+            onMessage = (data, flags) =>
+              # flags.binary will be set if a binary data is received
+              # flags.masked will be set if the data was masked
+              message = JSON.parse(data)
+
+              @emit 'raw_message', message
+
+              if message.type == "hello"
+                # connected really really
+                @logger.debug 'Got hello'
+                @connected = true
+                @_connAttempts = 0
+                @emit 'open'
+
+                clearTimeout timeout
+                ws.removeListener 'open', onOpen
+                ws.removeListener 'error', onError
+                ws.removeListener 'message', onMessage
+
+                callback null, ws
+                callback = 0
+
+            onError = (error) =>
+              @emit 'error', error
+
+              clearTimeout timeout
+              ws.removeListener 'open', onOpen
+              ws.removeListener 'error', onError
+              ws.removeListener 'message', onMessage
+              ws.close()
+
+              callback error
+              callback = 0
+
+            ws.on 'open', onOpen
+            ws.on 'message', onMessage
+            ws.on 'error', onError
+          ],
+
+          processLoop: ['ws', (callback, results) =>
+            ws = @ws = results.ws
+
+            ws.on 'message', (data, flags) =>
+              # flags.binary will be set if a binary data is received
+              # flags.masked will be set if the data was masked
+              @onMessage JSON.parse(data)
+
+            ws.on 'error', (error) =>
+              @emit 'error', error
+              clearInterval @_pongTimeout
+              ws.close()
+
+            ws.on 'close', =>
+              @emit 'close'
+              ws = null
+              clearInterval @_pongTimeout
+              callback()
+
+            ws.on 'ping', (data, flags) =>
+              ws.pong
+
+            @_lastPong = Date.now()
+
+            # start pings
+            @_pongTimeout = setInterval =>
+              @logger.debug 'ping'
+              @_send {"type": "ping"}
+
+              if @_lastPong? and Date.now() - @_lastPong > 10000
+                @logger.error 'Last pong is too old: %d', (Date.now() - @_lastPong) / 1000
+                clearInterval @_pongTimeout
+                ws.close()
+            , 5000
+          ]
+        }, (err) =>
+          if err
+            @_connAttempts++
+
+          @ws = null
+          callback()
+      , @_connAttempts * 1000
+    , =>
+      return @autoReconnect
 
 module.exports = Client
