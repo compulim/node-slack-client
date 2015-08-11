@@ -36,9 +36,11 @@ class Client extends EventEmitter
     @_pending       = {}
 
     @_connAttempts  = 0
+    @_workerStarted = false
+    @_reconnectOnce = false
 
     @logger         = new Log process.env.SLACK_LOG_LEVEL or 'info'
-    
+
   #
   # Logging in and connection management functions
   #
@@ -155,7 +157,7 @@ class Client extends EventEmitter
       @_pongTimeout = null
 
     @authenticated = false
-    
+
     # Test for a null value on ws to prevent system failure (e.g. if Bot is disabled)
     if @ws
       @ws.close()
@@ -489,7 +491,7 @@ class Client extends EventEmitter
 
       when 'star_added'
           @emit 'star_added', message
-      
+
       when 'star_removed'
           @emit 'star_removed', message
 
@@ -537,7 +539,7 @@ class Client extends EventEmitter
 
     post_data = querystring.stringify(params)
 
-    options = 
+    options =
       hostname: @host,
       method: 'POST',
       path: '/api/' + method,
@@ -565,24 +567,66 @@ class Client extends EventEmitter
     req.write('' + post_data)
     req.end()
 
-  login2: (state) ->
-    state = state or 'login'
+  # Initial call to establish the connection
+  login2: ->
+    if @_workerStarted
+      return false
+    else
+      @_workerStart('login');
+      return true
+
+  # Connect to the server without signing in (i.e. skip "rtm.start" REST call)
+  # Returns true, if we already have the WS URL and ok to connect, otherwise false
+  #
+  # TShould be called when the connection is dead and not auto reconnect
+  # This will skip the get "rtm.start" step
+  # WS URL is only valid for 30 seconds, wonder how useful this function is
+  connect2: ->
+    if not @_workerStarted and @socketUrl
+      @_workerStart('connect');
+
+      return true
+    else
+      return false
+
+  # Kill the existing connection and reconnect (regardless whether @autoReconnect is set or not)
+  # It seems this is internal function and should not be used by the user
+  reconnect2: ->
+    if @_workerStarted
+      @_reconnectOnce = true
+      @ws and @ws.close()
+    else
+      @_workerStart('login')
+
+  # Kill the existing connection and stop auto reconnect
+  # Returns true if connection will be killed, otherwise, false
+  #
+  # After calling disconnect(), it will take some time for the connection to die and @connect set to false
+  disconnect2: ->
+    @autoReconnect = false
+    @ws and @ws.close()
+
+    return @connected
+
+  _workerStart: (startState) ->
+    @_workerStarted = true
 
     async.doWhilst (callback) =>
-      @authenticated = false
-      @connected = false
+      @authenticated = @connected = @_reconnectOnce = false
+      @ws = null
 
       @_connAttempts and @logger.info 'Reconnecting in %dms', @_connAttempts * 1000
 
       setTimeout =>
         @_connAttempts and @logger.info 'Attempting reconnect'
+
         async.auto {
           webSocketUrl: (callback) =>
-            if state != 'login'
+            if startState != 'login'
               return callback null, @socketUrl
 
             timeout = setTimeout =>
-              callback && callback(new Error('timeout'))
+              callback and callback(new Error('timeout'))
               callback = 0
             , 10000
 
@@ -590,125 +634,133 @@ class Client extends EventEmitter
             @_apiCall 'rtm.start', {agent: 'node-slack'}, (data) =>
               clearTimeout timeout
 
-              if callback
-                if not data
-                  callback new Error()
-                else if not data.ok
-                  callback new Error(data.error)
-                else
-                  @authenticated = true
+              if not callback
+                return
+              else if not data
+                callback new Error()
+              else if not data.ok
+                callback new Error(data.error)
+              else
+                @authenticated = true
 
-                  # Important information about ourselves
-                  @self = new User @, data.self
-                  @team = new Team @, data.team.id, data.team.name, data.team.domain
+                # Important information about ourselves
+                @self = new User @, data.self
+                @team = new Team @, data.team.id, data.team.name, data.team.domain
 
-                  # Stash our websocket url away for later -- must be used within 30 seconds!
-                  @socketUrl = data.url
+                # Stash our websocket url away for later -- must be used within 30 seconds!
+                @socketUrl = data.url
 
-                  # Stash our list of other users (DO THIS FIRST)
-                  for k of data.users
-                    u = data.users[k]
-                    @users[u.id] = new User @, u
+                # Stash our list of other users (DO THIS FIRST)
+                for k of data.users
+                  u = data.users[k]
+                  @users[u.id] = new User @, u
 
-                  # Stash our list of channels
-                  for k of data.channels
-                    c = data.channels[k]
-                    @channels[c.id] = new Channel @, c
+                # Stash our list of channels
+                for k of data.channels
+                  c = data.channels[k]
+                  @channels[c.id] = new Channel @, c
 
-                  # Stash our list of dms
-                  for k of data.ims
-                    i = data.ims[k]
-                    @dms[i.id] = new DM @, i
+                # Stash our list of dms
+                for k of data.ims
+                  i = data.ims[k]
+                  @dms[i.id] = new DM @, i
 
-                  # Stash our list of private groups
-                  for k of data.groups
-                    g = data.groups[k]
-                    @groups[g.id] = new Group @, g
+                # Stash our list of private groups
+                for k of data.groups
+                  g = data.groups[k]
+                  @groups[g.id] = new Group @, g
 
-                  # TODO: Process bots
+                # TODO: Process bots
 
-                  @emit 'loggedIn', @self, @team
-                  callback null, @socketUrl
+                @emit 'loggedIn', @self, @team
+                callback null, @socketUrl
 
-                callback = 0
+              callback = 0
 
           ws: ['webSocketUrl', (callback, results) =>
-            timeout = setTimeout =>
-              ws.removeListener 'open', onOpen
-              ws.removeListener 'error', onError
-              ws.removeListener 'message', onMessage
-              ws.close()
-
-              callback && callback new Error('timeout')
-              callback = 0
-            , 10000
-
             # ws = new WebSocket results.webSocketUrl
             ws = new WebSocket 'ws://localhost:7523'
 
-            onOpen = () =>
-              ws.send '__PROXYTO:' + results.webSocketUrl
+            unsubscribe = subscribe ws, {
+              open: () =>
+                @logger.debug 'WebSocket opened'
+                ws.send '__PROXYTO:' + results.webSocketUrl
+              ,
 
-            onMessage = (data, flags) =>
-              # flags.binary will be set if a binary data is received
-              # flags.masked will be set if the data was masked
-              message = JSON.parse(data)
+              message: (data, flags) =>
+                # flags.binary will be set if a binary data is received
+                # flags.masked will be set if the data was masked
+                message = JSON.parse(data)
 
-              @emit 'raw_message', message
+                @emit 'raw_message', message
 
-              if message.type == "hello"
-                # connected really really
-                @logger.debug 'Got hello'
-                @connected = true
-                @_connAttempts = 0
-                @emit 'open'
+                if message.type == "hello"
+                  # connected really really
+                  @logger.debug 'Got "hello"'
+                  @connected = true
+                  @_connAttempts = 0
+                  @emit 'open'
+
+                  clearTimeout timeout
+                  unsubscribe()
+
+                  callback and callback null, ws
+                  callback = 0
+              ,
+
+              error: (error) =>
+                @emit 'error', error
 
                 clearTimeout timeout
-                ws.removeListener 'open', onOpen
-                ws.removeListener 'error', onError
-                ws.removeListener 'message', onMessage
+                unsubscribe()
+                ws.close()
 
-                callback null, ws
+                callback and callback error
                 callback = 0
+            }
 
-            onError = (error) =>
-              @emit 'error', error
-
-              clearTimeout timeout
-              ws.removeListener 'open', onOpen
-              ws.removeListener 'error', onError
-              ws.removeListener 'message', onMessage
+            timeout = setTimeout =>
+              unsubscribe()
               ws.close()
 
-              callback error
+              callback and callback new Error('timeout')
               callback = 0
-
-            ws.on 'open', onOpen
-            ws.on 'message', onMessage
-            ws.on 'error', onError
+            , 10000
           ],
 
           processLoop: ['ws', (callback, results) =>
             ws = @ws = results.ws
 
-            ws.on 'message', (data, flags) =>
-              # flags.binary will be set if a binary data is received
-              # flags.masked will be set if the data was masked
-              @onMessage JSON.parse(data)
+            unsubscribe = subscribe ws, {
+              message: (data, flags) =>
+                # flags.binary will be set if a binary data is received
+                # flags.masked will be set if the data was masked
+                @onMessage JSON.parse(data)
+              ,
 
-            ws.on 'error', (error) =>
-              @emit 'error', error
-              clearInterval @_pongTimeout
-              ws.close()
+              error: (error) =>
+                @emit 'error', error
+                clearInterval @_pongTimeout
+                ws.close()
+              ,
 
-            ws.on 'close', =>
-              @emit 'close'
-              ws = null
-              clearInterval @_pongTimeout
-              callback()
+              close: =>
+                # Could be fired:
+                # 1. Server closed the connection silently
+                # 2. On error, we will call ws.close explicitly
+                # 3. On ping timeout, we will call ws.close explicitly
+                @emit 'close'
+                ws = null
 
-            ws.on 'ping', (data, flags) =>
-              ws.pong
+                unsubscribe()
+                clearInterval @_pongTimeout
+
+                callback()
+              ,
+
+              ping: (data, flags) =>
+                ws.pong
+            }
 
             @_lastPong = Date.now()
 
@@ -731,6 +783,16 @@ class Client extends EventEmitter
           callback()
       , @_connAttempts * 1000
     , =>
-      return @autoReconnect
+      return @autoReconnect or @_reconnectOnce
+    , =>
+      @authenticated = @connected = @_workerStarted = false
 
+subscribe = (target, handlers) =>
+  names = Object.getOwnPropertyNames handlers
+  names.forEach (name) =>
+    target.on name, handlers[name]
+
+  return =>
+    names.forEach (name) =>
+      target.removeListener name, handlers[name]
 module.exports = Client
